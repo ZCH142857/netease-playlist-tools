@@ -163,6 +163,12 @@ class NcmApi:
                     songs[sid] = {**song, "privilege": privileges.get(str(sid), song.get("privilege"))}
         return [songs[sid] for sid in song_ids if sid in songs]
 
+    def song_lyric(self, song_id: int) -> str:
+        body = self.request("/lyric", {"id": song_id})
+        lrc = body.get("lrc")
+        lyric = lrc.get("lyric") if isinstance(lrc, dict) else None
+        return lyric if isinstance(lyric, str) else ""
+
     def remove_playlist_tracks(self, playlist_id: int, song_ids: list[int]) -> None:
         self._edit_playlist_tracks(playlist_id, song_ids, "del")
 

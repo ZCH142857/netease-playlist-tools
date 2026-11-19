@@ -14,8 +14,9 @@ from PySide6.QtWidgets import (
 )
 
 from .collection_sync import SyncReport, add_missing_likes
-from .gui import CHECKED, UNCHECKED, USER, Worker, button, label, table
-from .management import ManagementScan, add_to_playlist, scan_management
+from .gui import CHECKED, UNCHECKED, USER, VisibleCheckBox, Worker, button, label, table
+from .management import InstrumentalScan, ManagementScan, add_to_playlist, remove_likes, scan_instrumentals, scan_management
+from .management_store import ManagementStoreError, load_snapshot, save_snapshot
 from .removal import RemovalReport, by_playlist, remove_tracks
 from .scanner import Occurrence, Playlist, TrackKey
 
@@ -36,7 +37,8 @@ class ManagementPage(QWidget):
         self.cookie: dict[str, str] = {}
         self.job: Worker | None = None
         self._external_busy = False
-        self._scan_attempted = False
+        self._load_attempted = False
+        self._needs_refresh = False
         self._has_results = False
         self._remove_retry_at = 0.0
         self.playlists: list[Playlist] = []
@@ -46,6 +48,8 @@ class ManagementPage(QWidget):
         self._checked: set[TrackKey] = set()
         self._visible_rows: dict[TrackKey, Occurrence] = {}
         self._visible_items: dict[TrackKey, QTreeWidgetItem] = {}
+        self._instrumentals: dict[int, bool] = {}
+        self._pending_lyrics: tuple[int, ...] = ()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -58,7 +62,9 @@ class ManagementPage(QWidget):
         heading = QHBoxLayout()
         heading.addWidget(label("歌单管理", "section"))
         heading.addStretch(1)
-        self.refresh_button = button("刷新歌单", self._refresh)
+        self.load_button = button("加载上次结果", self._load_previous)
+        self.refresh_button = button("刷新结果", self._refresh)
+        heading.addWidget(self.load_button)
         heading.addWidget(self.refresh_button)
         body.addLayout(heading)
 
@@ -72,8 +78,11 @@ class ManagementPage(QWidget):
         self.search_input.setAccessibleName("搜索歌曲")
         self.search_input.setPlaceholderText("搜索歌名、歌手、专辑或歌曲 ID")
         self.search_input.setClearButtonEnabled(True)
+        self.instrumental_filter = VisibleCheckBox("仅纯音乐")
+        self.instrumental_filter.setToolTip("仅显示歌词区标注「纯音乐，请欣赏」的歌曲")
         filters.addWidget(self.playlist_filter)
         filters.addWidget(self.search_input, 1)
+        filters.addWidget(self.instrumental_filter)
         body.addLayout(filters)
         self.summary = label("", "summary")
         self.summary.setWordWrap(True)
@@ -95,13 +104,14 @@ class ManagementPage(QWidget):
         self.selection = label("", "selection")
         self.selection.setWordWrap(True)
         self.like_button = button("批量红心", self._like_selected, primary=True)
+        self.unlike_button = button("批量取消红心", self._unlike_selected)
         self.copy_button = button("添加到歌单", self._copy_selected)
         self.remove_button = button("从歌单移除", self._remove_selected)
         self.remove_button.setObjectName("remove")
         actions.addWidget(self.select_button)
         actions.addWidget(self.clear_button)
         actions.addWidget(self.selection, 1)
-        for action in (self.like_button, self.copy_button, self.remove_button):
+        for action in (self.like_button, self.unlike_button, self.copy_button, self.remove_button):
             actions.addWidget(action)
         body.addLayout(actions)
         layout.addWidget(card, 1)
@@ -138,8 +148,13 @@ class ManagementPage(QWidget):
         self._cooldown_timer = QTimer(self)
         self._cooldown_timer.setInterval(1000)
         self._cooldown_timer.timeout.connect(self._update_selection)
+        self._lyrics_timer = QTimer(self)
+        self._lyrics_timer.setSingleShot(True)
+        self._lyrics_timer.setInterval(300)
+        self._lyrics_timer.timeout.connect(self._check_instrumentals)
         self.playlist_filter.currentIndexChanged.connect(self._filter_changed)
         self.search_input.textChanged.connect(self._filter_changed)
+        self.instrumental_filter.toggled.connect(self._filter_changed)
         self._set_playlist_options()
         self._render()
         self._update_controls()
@@ -152,7 +167,8 @@ class ManagementPage(QWidget):
         self.cookie = cookie.copy()
         if uid != self.uid:
             self.uid = uid
-            self.invalidate()
+            self._load_attempted = False
+            self._needs_refresh = False
             self._has_results = False
             self._remove_retry_at = 0.0
             self.playlists = []
@@ -160,7 +176,12 @@ class ManagementPage(QWidget):
             self.warnings = []
             self.details = []
             self._checked.clear()
+            self._instrumentals.clear()
+            self._lyrics_timer.stop()
             self._set_playlist_options()
+            self.instrumental_filter.blockSignals(True)
+            self.instrumental_filter.setChecked(False)
+            self.instrumental_filter.blockSignals(False)
             self.search_input.blockSignals(True)
             self.search_input.clear()
             self.search_input.blockSignals(False)
@@ -176,11 +197,15 @@ class ManagementPage(QWidget):
         self._update_controls()
 
     def invalidate(self) -> None:
-        self._scan_attempted = False
+        self._needs_refresh = True
 
     def ensure_loaded(self) -> None:
-        if not self._scan_attempted:
+        if self._needs_refresh:
             self._refresh()
+        elif not self._load_attempted:
+            self._load_previous(refresh_if_missing=True)
+        else:
+            self._schedule_lyrics()
 
     @staticmethod
     def _playlist_label(playlist: Playlist) -> str:
@@ -202,6 +227,7 @@ class ManagementPage(QWidget):
     def _filter_changed(self, *_args) -> None:
         self._remember_checks()
         self._render()
+        self._schedule_lyrics()
 
     @staticmethod
     def _matches(row: Occurrence, terms: list[str]) -> bool:
@@ -221,13 +247,20 @@ class ManagementPage(QWidget):
         view.clear()
         search_terms = _search_text(self.search_input.text()).split()
         selected_pid = self.playlist_filter.currentData()
+        only_instrumentals = self.instrumental_filter.isChecked()
+        pending_lyrics: dict[int, None] = {}
         names = Counter(playlist.name for playlist in self.playlists)
         for playlist in self.playlists:
             if selected_pid is not None and playlist.id != selected_pid:
                 continue
             rows = self.tracks.get(playlist.id)
             matches = [row for row in (rows or ()) if self._matches(row, search_terms)] if search_terms else rows or []
-            if search_terms and not matches:
+            if only_instrumentals:
+                pending_lyrics.update(dict.fromkeys(
+                    row.song_id for row in matches if row.song_id not in self._instrumentals
+                ))
+                matches = [row for row in matches if self._instrumentals.get(row.song_id)]
+            if (search_terms or only_instrumentals) and not matches:
                 continue
             name = self._playlist_label(playlist) if names[playlist.name] > 1 else playlist.name
             count = f"{len(matches):,} 条" if rows is not None else "未读取"
@@ -252,11 +285,16 @@ class ManagementPage(QWidget):
                               or (not expanded and view.topLevelItemCount() == 1))
         view.setUpdatesEnabled(True)
         view.blockSignals(False)
+        self._pending_lyrics = tuple(pending_lyrics)
 
         if not self._has_results:
             headline = "登录后显示自建歌单" if self.uid is None else "等待读取自建歌单"
         elif not self.playlists:
             headline = "当前账号没有可管理的自建歌单"
+        elif only_instrumentals:
+            headline = f"已识别 {len(self._visible_rows):,} 条纯音乐"
+            if pending_lyrics:
+                headline += f" · {len(pending_lyrics):,} 首歌词待核对"
         elif search_terms and not self._visible_rows:
             headline = "当前范围内没有匹配的歌曲"
         else:
@@ -286,6 +324,8 @@ class ManagementPage(QWidget):
         seconds = max(0, ceil(self._remove_retry_at - time.monotonic()))
         if seconds == 0:
             self._cooldown_timer.stop()
+        self.unlike_button.setEnabled(idle and count > 0 and seconds == 0)
+        self.unlike_button.setToolTip(f"{seconds} 秒后可取消红心" if seconds else "")
         self.remove_button.setText(f"稍后移除（{seconds} 秒）" if seconds else "从歌单移除")
         self.remove_button.setEnabled(idle and count > 0 and seconds == 0)
 
@@ -310,9 +350,11 @@ class ManagementPage(QWidget):
     def _update_controls(self) -> None:
         idle = not (self.busy or self._external_busy)
         readable = idle and self.uid is not None
+        self.load_button.setEnabled(readable)
         self.refresh_button.setEnabled(readable)
         self.playlist_filter.setEnabled(readable and bool(self.playlists))
         self.search_input.setEnabled(readable and bool(self.playlists))
+        self.instrumental_filter.setEnabled(readable and bool(self.playlists))
         self.track_table.setEnabled(readable)
         self.details_button.setVisible(bool(self.warnings or self.details))
         self.details_button.setEnabled(idle)
@@ -320,16 +362,58 @@ class ManagementPage(QWidget):
         self.stop_button.setEnabled(self.busy and not self.job.isInterruptionRequested())
         self._update_selection()
 
+    def _load_previous(self, *, refresh_if_missing: bool = False) -> None:
+        if not self.load_button.isEnabled():
+            return
+        self._load_attempted = True
+        self.details = []
+        self.progress.hide()
+        self.progress_value.clear()
+        warning = ""
+        try:
+            result = load_snapshot(self.uid)
+        except ManagementStoreError as exc:
+            result = None
+            warning = str(exc)
+
+        if result is not None:
+            self._apply_scan(result)
+            self.status.setText(self._scan_summary("已加载上次结果"))
+            self._schedule_lyrics()
+        elif refresh_if_missing:
+            self._refresh()
+        else:
+            self.status.setText(warning.splitlines()[0] if warning else "本机还没有上次结果。可点击「刷新结果」。")
+        if warning:
+            self.details.append(warning)
+        self._update_controls()
+
     def _refresh(self) -> None:
-        if self._launch("scan", scan_management, "正在读取自建歌单。"):
-            self._scan_attempted = True
+        if self._launch("scan", scan_management, "正在刷新自建歌单。"):
+            self._load_attempted = True
+            self._needs_refresh = False
+
+    def _schedule_lyrics(self) -> None:
+        if self._pending_lyrics:
+            self._lyrics_timer.start()
+        else:
+            self._lyrics_timer.stop()
+
+    def _check_instrumentals(self) -> None:
+        if self._pending_lyrics and self.isVisible():
+            song_ids = self._pending_lyrics
+            self._launch(
+                "instrumentals",
+                lambda api, _uid, progress, stop: scan_instrumentals(api, song_ids, progress, stop),
+                "正在核对当前范围内的歌词。",
+            )
 
     def _launch(self, kind: str, action: Callable, message: str) -> bool:
         uid = self.uid
         if uid is None or self.busy or self._external_busy:
             return False
         cookie = self.cookie.copy()
-        write = kind != "scan"
+        write = kind not in {"scan", "instrumentals"}
 
         def run(worker: Worker):
             # A stopped write still needs a read-back to reconcile in-flight changes.
@@ -337,7 +421,7 @@ class ManagementPage(QWidget):
             api.cookie = cookie
             return action(api, uid, worker.progress.emit, worker.isInterruptionRequested)
 
-        worker = Worker(kind, run, self, deliver_on_cancel=write)
+        worker = Worker(kind, run, self, deliver_on_cancel=write or kind == "instrumentals")
         worker.progress.connect(self._report_progress)
         worker.result.connect(self._receive)
         worker.failure.connect(self._failure)
@@ -363,13 +447,15 @@ class ManagementPage(QWidget):
             self.stop_button.setEnabled(False)
 
     def _finished(self) -> None:
-        changed = self.job.kind != "scan"
+        kind = self.job.kind
         self.job.deleteLater()
         self.job = None
         self._update_controls()
-        if changed:
+        if kind not in {"scan", "instrumentals"}:
             self.playlists_changed.emit()
         self.busy_changed.emit(False)
+        if kind != "instrumentals":
+            self._schedule_lyrics()
 
     def _failure(self, message: str) -> None:
         self.status.setText(message)
@@ -396,6 +482,17 @@ class ManagementPage(QWidget):
             self._launch(
                 "likes", lambda api, uid, progress, stop: add_missing_likes(api, uid, songs, progress, stop),
                 "正在核对待加红心的歌曲。",
+            )
+
+    def _unlike_selected(self) -> None:
+        if not self.unlike_button.isEnabled():
+            return
+        rows = self._selected()
+        count = len({row.song_id for row in rows})
+        if count and self._confirm("确认批量取消红心", f"将所选的 {count:,} 首歌曲从「我喜欢的音乐」移除。"):
+            self._launch(
+                "unlikes", lambda api, uid, progress, stop: remove_likes(api, uid, rows, progress, stop),
+                "正在核对待取消红心的歌曲。",
             )
 
     def _copy_selected(self) -> None:
@@ -453,8 +550,12 @@ class ManagementPage(QWidget):
     def _receive(self, kind: str, result: object) -> None:
         if kind == "scan":
             self._show_scan(result)
+        elif kind == "instrumentals":
+            self._show_instrumentals(result)
         elif kind == "remove":
             self._show_removal(result)
+        elif kind == "unlikes":
+            self._show_removal_report(result, unlike=True)
         elif kind == "copy":
             target, selected, report = result
             present = report.verified | report.already_present
@@ -464,25 +565,65 @@ class ManagementPage(QWidget):
                 additions = [replace(row, playlist=target) for sid, row in selected.items() if sid in present - known]
                 self.tracks[target.id] = [*target_rows, *additions]
                 self._render()
+                if additions:
+                    self._save()
             elif present:
-                self.details.append("刷新歌单可查看目标歌单的最新歌曲。")
+                self.details.append("点击「刷新结果」可查看目标歌单的最新歌曲。")
             self._show_sync_report(report, "已添加")
         elif kind == "likes":
             self._show_sync_report(result, "已加红心")
 
     def _show_scan(self, result: ManagementScan) -> None:
+        if result.playlists and not result.tracks and self._has_results:
+            self.details.extend(result.warnings)
+            self.status.setText("未能刷新歌单，继续显示上次结果。请查看详情。")
+            return
+        self._apply_scan(result)
+        note = self._scan_summary("已读取")
+        if (result.tracks or not result.playlists) and not self._save():
+            note += " · 结果未能保存，请查看详情"
+        self._report_progress(100, note)
+
+    def _apply_scan(self, result: ManagementScan) -> None:
         self._remember_checks()
         self.playlists = result.playlists
         self.tracks = result.tracks
         self.warnings = result.warnings
+        self._instrumentals = result.instrumentals.copy()
         self._has_results = True
         self._checked.intersection_update(row.key for rows in self.tracks.values() for row in rows)
         self._set_playlist_options()
         self._render()
-        note = f"已读取 {len(self.tracks):,} 个自建歌单"
+
+    def _scan_summary(self, action: str) -> str:
+        note = f"{action} · {len(self.tracks):,} 个自建歌单"
         if self.warnings:
             note += " · 部分数据缺失，请查看详情"
-        self._report_progress(100, note)
+        return note
+
+    def _save(self) -> bool:
+        try:
+            save_snapshot(self.uid, ManagementScan(self.playlists, self.tracks, self.warnings, self._instrumentals))
+        except ManagementStoreError as exc:
+            self.details.append(str(exc))
+            return False
+        return True
+
+    def _show_instrumentals(self, result: InstrumentalScan) -> None:
+        self._remember_checks()
+        self._instrumentals.update(result.checked)
+        self.details.extend(result.warnings)
+        self._render()
+        done = len(result.checked)
+        note = f"已核对 {done:,} 首歌曲的歌词"
+        if result.stopped:
+            note = f"已停止 · {note}"
+        if result.pending:
+            note += f" · {result.pending:,} 首待核对，可重新勾选「仅纯音乐」重试"
+        if result.checked and not self._save():
+            note += " · 结果未能保存，请查看详情"
+        percent = round(100 * done / (done + result.pending)) if result.pending else 100
+        self._report_progress(percent, note)
 
     def _show_sync_report(self, report: SyncReport, action: str) -> None:
         pieces = [f"{action} {len(report.verified):,} 首"]
@@ -507,17 +648,23 @@ class ManagementPage(QWidget):
         self._checked.difference_update(done)
         for pid in {pid for pid, _ in done}:
             self.tracks[pid] = [row for row in self.tracks[pid] if row.key not in done]
+        if done:
+            self._save()
+        self._render()
+        self._show_removal_report(report)
+
+    def _show_removal_report(self, report: RemovalReport, *, unlike: bool = False) -> None:
         self.details.extend(f"歌单 {pid} · 歌曲 {sid} · {reason}" for (pid, sid), reason in report.failures.items())
         if report.retry_at > time.monotonic():
             self._remove_retry_at = report.retry_at
             self._cooldown_timer.start()
-        self._render()
-        pieces = [f"已移除 {len(report.removed):,} 条"]
+        action, absent, unit = ("已取消红心", "原未点红心", "首") if unlike else ("已移除", "原已不在歌单", "条")
+        pieces = [f"{action} {len(report.removed):,} {unit}"]
         for caption, count in (
-            ("原已不在歌单", len(report.already_absent)), ("未确认", len(report.failures)), ("未处理", report.pending),
+            (absent, len(report.already_absent)), ("未确认", len(report.failures)), ("未处理", report.pending),
         ):
             if count:
-                pieces.append(f"{caption} {count:,} 条")
+                pieces.append(f"{caption} {count:,} {unit}")
         if report.stopped:
             pieces.insert(0, "已停止")
         if not report.pending and not report.failures:

@@ -1,9 +1,11 @@
 import base64
 import json
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 from unittest.mock import patch
 
@@ -15,7 +17,9 @@ from PySide6.QtWidgets import (
 )
 
 from ncm_checker.gui import CHECKED, UNCHECKED, USER, AccountRead, MainWindow, configure_theme
-from ncm_checker.scanner import playlists_for
+from ncm_checker.management import ManagementScan
+from ncm_checker.management_store import load_snapshot, save_snapshot, snapshot_path
+from ncm_checker.scanner import Occurrence, Playlist, playlists_for
 
 
 def close_window(window):
@@ -25,6 +29,24 @@ def close_window(window):
 
 
 class GuiFlowTest(unittest.TestCase):
+    def isolate_management_cache(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        storage = patch(
+            "ncm_checker.management_store.snapshot_path",
+            side_effect=lambda uid, *, directory=None: snapshot_path(uid, directory=directory or Path(temp.name)),
+        )
+        storage.start()
+        self.addCleanup(storage.stop)
+
+    def wait_idle(self, app, window):
+        deadline = time.monotonic() + 5
+        while window._is_busy() and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        self.assertFalse(window._is_busy())
+        app.processEvents()
+
     def test_feature_entries_align_and_cross_playlist_checkbox_paints_and_toggles(self):
         app = QApplication.instance() or QApplication(["test"])
         dark = app.palette()
@@ -72,9 +94,10 @@ class GuiFlowTest(unittest.TestCase):
             close_window(window)
 
     def test_management_loads_owned_playlists_and_applies_only_visible_selections(self):
+        self.isolate_management_cache()
         app = QApplication.instance() or QApplication(["test"])
         configure_theme(app)
-        tracks = {1: [25], 10: [21, 22], 20: [21, 23], 30: [], 60: [23], 90: [25]}
+        tracks = {1: [25, 22], 10: [21, 22], 20: [21, 23], 30: [], 60: [23], 90: [25]}
         playlist_names = {1: "我喜欢的音乐", 10: "通勤", 20: "周末", 30: "目标", 60: "视频", 90: "收藏"}
         titles = {21: "日落", 22: "山谷", 23: "湖面"}
         reads = []
@@ -109,6 +132,10 @@ class GuiFlowTest(unittest.TestCase):
                 writes.append(("like", sid))
                 tracks[1].append(sid)
 
+            def unlike_track(self, sid):
+                writes.append(("unlike", sid))
+                tracks[1].remove(sid)
+
             def add_playlist_tracks(self, pid, song_ids):
                 writes.append(("add", pid, tuple(song_ids)))
                 tracks[pid].extend(song_ids)
@@ -120,14 +147,6 @@ class GuiFlowTest(unittest.TestCase):
         window = MainWindow(3100, api_factory=FixtureApi)
         window.show()
         page = window.management_page
-
-        def wait_idle():
-            deadline = time.monotonic() + 5
-            while (window.job is not None or page.busy) and time.monotonic() < deadline:
-                app.processEvents()
-                time.sleep(0.01)
-            self.assertFalse(window._is_busy())
-            app.processEvents()
 
         def group(playlist_id):
             return next(
@@ -148,18 +167,20 @@ class GuiFlowTest(unittest.TestCase):
             window.management_button.click()
             self.assertIs(window.pages.currentWidget(), page)
             self.assertFalse(page.refresh_button.isEnabled())
+            self.assertFalse(page.load_button.isEnabled())
             self.assertEqual(reads, [])
             api = FixtureApi(3100, lambda: None)
             window._launch("login", lambda _worker: AccountRead(
                 {"MUSIC_U": "fixture"}, api.login_status(), playlists_for(api, 99),
             ), "模拟登录")
-            wait_idle()
+            self.wait_idle(app, window)
             self.assertEqual(set(reads), {10, 20, 30})
             self.assertIs(window.pages.currentWidget(), page)
             self.assertFalse(window.main_footer.isVisible())
             self.assertEqual(group(10).childCount(), 2)
             self.assertEqual(group(20).childCount(), 2)
             self.assertFalse(page.like_button.isEnabled())
+            self.assertFalse(page.unlike_button.isEnabled())
 
             group(10).setCheckState(0, CHECKED)
             app.processEvents()
@@ -176,7 +197,7 @@ class GuiFlowTest(unittest.TestCase):
                 "ncm_checker.management_ui.QInputDialog.getItem", side_effect=choose_target,
             ):
                 page.like_button.click()
-                wait_idle()
+                self.wait_idle(app, window)
                 self.assertEqual(writes, [("like", 21)])
 
                 page.playlist_filter.setCurrentIndex(0)
@@ -184,8 +205,17 @@ class GuiFlowTest(unittest.TestCase):
                 group(10).setCheckState(0, CHECKED)
                 group(20).setCheckState(0, CHECKED)
                 app.processEvents()
+                self.assertEqual(page.unlike_button.text(), "批量取消红心")
+                self.assertTrue(page.unlike_button.isEnabled())
+                page.unlike_button.click()
+                self.wait_idle(app, window)
+                self.assertEqual(writes, [("like", 21), ("unlike", 21)])
+                self.assertEqual(tracks[1], [25, 22])
+                self.assertEqual(tracks[10], [21, 22])
+                self.assertEqual(tracks[20], [21, 23])
+
                 page.copy_button.click()
-                wait_idle()
+                self.wait_idle(app, window)
                 self.assertEqual(writes[-1], ("add", 30, (21,)))
                 self.assertIn(21, tracks[10])
                 self.assertIn(21, tracks[20])
@@ -196,16 +226,136 @@ class GuiFlowTest(unittest.TestCase):
             with patch.object(page, "_confirm", return_value=False) as confirm:
                 page.remove_button.click()
                 confirm.assert_called_once()
-                self.assertEqual(len(writes), 2)
+                self.assertEqual(len(writes), 3)
             with patch.object(page, "_confirm", return_value=True):
                 page.remove_button.click()
-                wait_idle()
+                self.wait_idle(app, window)
             self.assertEqual(writes[-1], ("remove", 20, (21,)))
-            self.assertEqual(tracks, {1: [25, 21], 10: [21, 22], 20: [23], 30: [21], 60: [23], 90: [25]})
+            self.assertEqual(tracks, {1: [25, 22], 10: [21, 22], 20: [23], 30: [21], 60: [23], 90: [25]})
+            saved = load_snapshot(99)
+            self.assertEqual([row.song_id for row in saved.tracks[20]], [23])
+            self.assertEqual([row.song_id for row in saved.tracks[30]], [21])
 
             window._receive("forget", None)
             self.assertIs(window.pages.currentWidget(), window.overview_page)
             self.assertEqual(page.track_table.topLevelItemCount(), 0)
+        finally:
+            close_window(window)
+
+    def test_management_loads_cached_results_by_default_and_refreshes_on_demand(self):
+        self.isolate_management_cache()
+        app = QApplication.instance() or QApplication(["test"])
+        configure_theme(app)
+        user_id = 99
+        playlist = Playlist(10, "通勤", 1, "自建", editable=True)
+
+        def result(song_id, title):
+            return ManagementScan([playlist], {10: [Occurrence(song_id, title, "歌手", playlist)]}, [])
+
+        save_snapshot(user_id, result(21, "上次的歌"))
+        latest = result(23, "最新的歌")
+        window = MainWindow(3100)
+        window.show()
+        page = window.management_page
+
+        def displayed_title():
+            return page.track_table.topLevelItem(0).child(0).text(0)
+
+        try:
+            window._receive("login", AccountRead({"MUSIC_U": "fixture"}, {"userId": user_id}, [playlist]))
+            with patch("ncm_checker.management_ui.scan_management", return_value=latest) as scan:
+                window.management_button.click()
+                self.wait_idle(app, window)
+                scan.assert_not_called()
+                self.assertEqual(displayed_title(), "上次的歌")
+                self.assertEqual(page.load_button.text(), "加载上次结果")
+                self.assertEqual(page.refresh_button.text(), "刷新结果")
+
+                save_snapshot(user_id, result(22, "另存的歌"))
+                page.load_button.click()
+                self.wait_idle(app, window)
+                scan.assert_not_called()
+                self.assertEqual(displayed_title(), "另存的歌")
+
+                page.refresh_button.click()
+                self.wait_idle(app, window)
+                scan.assert_called_once()
+                self.assertEqual(displayed_title(), "最新的歌")
+                self.assertEqual(load_snapshot(user_id), latest)
+
+                scan.return_value = ManagementScan([playlist], {}, ["未能读取通勤歌单。"])
+                page.refresh_button.click()
+                self.wait_idle(app, window)
+                self.assertEqual(scan.call_count, 2)
+                self.assertEqual(displayed_title(), "最新的歌")
+                self.assertEqual(load_snapshot(user_id), latest)
+                self.assertIn("未能刷新歌单", page.status.text())
+        finally:
+            close_window(window)
+
+    def test_management_instrumental_filter_combines_search_and_playlist_scope(self):
+        self.isolate_management_cache()
+        app = QApplication.instance() or QApplication(["test"])
+        configure_theme(app)
+        commute = Playlist(10, "通勤", 3, "自建", editable=True)
+        weekend = Playlist(20, "周末", 2, "自建", editable=True)
+        playlists = [commute, weekend]
+        tracks = {
+            10: [Occurrence(21, "夜曲", "", commute), Occurrence(22, "夜曲·演唱", "", commute),
+                 Occurrence(23, "晴天", "", commute)],
+            20: [Occurrence(21, "夜曲", "", weekend), Occurrence(24, "海边", "", weekend)],
+        }
+        save_snapshot(99, ManagementScan(playlists, tracks, []))
+        requests = []
+
+        def request(path, payload):
+            self.assertEqual(path, "/lyric")
+            song_id = payload["id"]
+            requests.append(song_id)
+            if song_id in {21, 24}:
+                return {"lrc": {"lyric": "[00:00.00] 纯音乐，请欣赏"}}
+            return {"nolyric": True}
+
+        window = MainWindow(3100)
+        window.show()
+        page = window.management_page
+
+        def wait_for_lyrics():
+            QTest.qWait(page._lyrics_timer.interval() + 75)
+            self.wait_idle(app, window)
+
+        def visible_keys():
+            groups = (page.track_table.topLevelItem(index) for index in range(page.track_table.topLevelItemCount()))
+            return {
+                (group.data(0, USER), group.child(index).data(0, USER))
+                for group in groups for index in range(group.childCount())
+            }
+
+        try:
+            with patch("ncm_checker.api.NcmApi.request", side_effect=request):
+                window._receive("login", AccountRead({"MUSIC_U": "fixture"}, {"userId": 99}, playlists))
+                window.management_button.click()
+                page.search_input.setText("夜曲")
+                self.assertEqual(requests, [])
+                item = page.track_table.topLevelItem(0).child(1)
+                item.setCheckState(0, CHECKED)
+
+                page.instrumental_filter.click()
+                wait_for_lyrics()
+                self.assertEqual(requests, [21, 22])
+                self.assertEqual(visible_keys(), {(10, 21), (20, 21)})
+                self.assertFalse(page.like_button.isEnabled())
+
+                page.instrumental_filter.click()
+                self.assertEqual(page.track_table.topLevelItem(0).child(1).checkState(0), CHECKED)
+                page.playlist_filter.setCurrentIndex(page.playlist_filter.findData(20))
+                page.search_input.clear()
+                page.instrumental_filter.click()
+                wait_for_lyrics()
+                self.assertEqual(requests, [21, 22, 24])
+                self.assertEqual(visible_keys(), {(20, 21), (20, 24)})
+                self.assertEqual(load_snapshot(99).instrumentals, {21: True, 22: False, 24: True})
+                self.assertFalse(window.playlists_need_refresh)
         finally:
             close_window(window)
 

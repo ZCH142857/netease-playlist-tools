@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from .api import ApiConnectionError, ApiError, ApiRateLimitError, Cancelled, NcmApi
 from .collection_sync import Progress, Stop, SyncReport, _add_and_verify, _check_stop, _read_ids, _retry_read
+from .removal import RemovalReport, remove_tracks
 from .scanner import Occurrence, Playlist, playlists_for, track_album, track_artists
+
+
+_LYRIC_TIMESTAMPS = re.compile(r"^(?:\[\d+:\d{2}(?:[.:]\d+)?\]\s*)+")
+_INSTRUMENTAL_NOTICE = re.compile(r"纯音乐\s*,\s*请欣赏[!。]?")
 
 
 @dataclass(frozen=True)
@@ -13,13 +20,26 @@ class ManagementScan:
     playlists: list[Playlist]
     tracks: dict[int, list[Occurrence]]
     warnings: list[str]
+    instrumentals: dict[int, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class InstrumentalScan:
+    checked: dict[int, bool]
+    pending: int
+    warnings: list[str]
+    stopped: bool
+
+
+def _account_playlists(api: NcmApi, uid: int) -> list[Playlist]:
+    if str(api.login_status().get("userId")) != str(uid):
+        raise ApiError("当前登录账号已变化，请重新登录并读取歌单。")
+    return playlists_for(api, uid)
 
 
 def _managed_playlists(api: NcmApi, uid: int) -> list[Playlist]:
-    if str(api.login_status().get("userId")) != str(uid):
-        raise ApiError("当前登录账号已变化，请重新登录并读取歌单。")
     return [
-        playlist for playlist in playlists_for(api, uid)
+        playlist for playlist in _account_playlists(api, uid)
         if playlist.category == "自建" and playlist.editable and not playlist.video
     ]
 
@@ -79,6 +99,65 @@ def scan_management(
         tracks[playlist.id] = rows
     progress(100, "歌单读取完成，有部分资料未能读取" if warnings else "歌单读取完成")
     return ManagementScan(playlists, tracks, warnings)
+
+
+def scan_instrumentals(
+    api: NcmApi,
+    song_ids: Iterable[int],
+    progress: Progress,
+    should_stop: Stop,
+) -> InstrumentalScan:
+    ordered = list(dict.fromkeys(song_ids))
+    checked = {}
+    warnings = []
+    stopped = False
+    for index, song_id in enumerate(ordered):
+        if should_stop():
+            stopped = True
+            break
+        progress(round(100 * index / len(ordered)), f"正在核对歌词 · {index + 1:,}/{len(ordered):,} 首")
+        try:
+            lyric = api.song_lyric(song_id)
+        except Cancelled:
+            stopped = True
+            break
+        except (ApiConnectionError, ApiRateLimitError) as exc:
+            warnings.append(str(exc))
+            break
+        except ApiError as exc:
+            warnings.append(f"歌曲 {song_id} · {exc}")
+            continue
+        lines = unicodedata.normalize("NFKC", lyric).splitlines()
+        checked[song_id] = any(
+            _INSTRUMENTAL_NOTICE.fullmatch(_LYRIC_TIMESTAMPS.sub("", line.lstrip("\ufeff \t")).strip())
+            for line in lines
+        )
+    return InstrumentalScan(checked, len(ordered) - len(checked), warnings, stopped)
+
+
+def remove_likes(
+    api: NcmApi,
+    uid: int,
+    songs: Iterable[Occurrence],
+    progress: Progress,
+    should_stop: Stop,
+) -> RemovalReport:
+    selected = {song.song_id: song for song in songs}
+    if not selected:
+        return RemovalReport()
+    progress(0, "核对网易云账号与「我喜欢的音乐」歌单")
+    try:
+        playlists = _retry_read(lambda: _account_playlists(api, uid), progress, should_stop, 0)
+    except Cancelled:
+        return RemovalReport(pending=len(selected), stopped=True)
+    liked = [
+        playlist for playlist in playlists
+        if playlist.category == "喜欢" and playlist.editable and not playlist.video
+    ]
+    if len(liked) != 1:
+        raise ApiError("无法唯一识别当前账号的「我喜欢的音乐」歌单。")
+    targets = [replace(song, playlist=liked[0]) for song in selected.values()]
+    return remove_tracks(api, uid, targets, progress, should_stop)
 
 
 def add_to_playlist(

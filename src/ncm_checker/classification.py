@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
+from .local_state import state_directory, write_json
 from .scanner import Playlist
 
 
@@ -96,13 +94,7 @@ def snapshot_path(uid: int, *, directory: Path | None = None) -> Path:
     if type(uid) is not int or uid <= 0:
         raise ClassificationStoreError("无法确定分类结果所属的账号。")
     if directory is None:
-        if sys.platform == "darwin":
-            directory = Path.home() / "Library" / "Application Support" / "网易云歌单查重" / "classification"
-        else:
-            state_home = Path(os.environ.get("XDG_STATE_HOME", ""))
-            if not state_home.is_absolute():
-                state_home = Path.home() / ".local" / "state"
-            directory = state_home / "ncm-checker" / "classification"
+        directory = state_directory() / "classification"
     return directory / f"{uid}.json"
 
 
@@ -119,24 +111,10 @@ def save_snapshot(snapshot: ClassificationSnapshot, *, directory: Path | None = 
     }
     if snapshot.missing_likes is not None:
         payload["missing_likes"] = [asdict(song) for song in snapshot.missing_likes]
-    temporary_path = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as temporary:
-            temporary_path = Path(temporary.name)
-            json.dump(payload, temporary, ensure_ascii=False, indent=2)
-            temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_path, path)
+        write_json(path, payload)
     except (OSError, UnicodeError) as exc:
         raise ClassificationStoreError(f"保存归集结果失败。{path}\n{exc}") from exc
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
     return path
 
 

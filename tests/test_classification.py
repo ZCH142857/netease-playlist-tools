@@ -117,7 +117,7 @@ class ClassificationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             path = save_snapshot(original, directory=directory)
-            with patch("ncm_checker.classification.os.replace", side_effect=OSError("permission denied")):
+            with patch("ncm_checker.local_state.os.replace", side_effect=OSError("permission denied")):
                 with self.assertRaises(ClassificationStoreError):
                     save_snapshot(replacement, directory=directory)
             self.assertEqual(load_snapshot(123, directory=directory), original)
